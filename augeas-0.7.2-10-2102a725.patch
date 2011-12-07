@@ -1,0 +1,143 @@
+commit 2102a725327c6704cfb5bbf57fd1ed9e86cfe0f9
+Author: David Lutterkort <lutter@redhat.com>
+Date:   Thu Aug 5 12:24:02 2010 -0700
+
+    Fix BZ 613967 - memory corruption on reloading externally modified file
+    
+    The problem was that when we replaced the old tree for a file with the new
+    one we just read from the file, the replace operation did not update
+    nodesets in variables, since we did not pass the global symtab into
+    tree_replace.
+    
+      * src/internal.h (tree_replace): pass in struct augeas, so that we have
+        access to the global symtab
+      * src/augeas.c (tree_replace): make sure we create the pathx with the
+        global symtab
+      * src/transform.c (load_file): adapt to new prototype for tree_replace
+      * tests/test-load.c (testReloadExternalMod): test that we do not segfault
+        when a file was modified externally
+
+diff --git a/src/augeas.c b/src/augeas.c
+index 9ae217e..68ef86c 100644
+--- a/src/augeas.c
++++ b/src/augeas.c
+@@ -916,13 +916,13 @@ int aug_rm(struct augeas *aug, const char *path) {
+     return -1;
+ }
+ 
+-int tree_replace(struct tree *origin, const char *path, struct tree *sub) {
++int tree_replace(struct augeas *aug, const char *path, struct tree *sub) {
+     struct tree *parent;
+     struct pathx *p = NULL;
+     int r;
+ 
+-    if (pathx_parse(origin, NULL, path, true, NULL, &p) != PATHX_NOERROR)
+-        goto error;
++    p = parse_user_pathx(aug, true, path);
++    ERR_BAIL(aug);
+ 
+     r = tree_rm(p);
+     if (r == -1)
+diff --git a/src/internal.h b/src/internal.h
+index 7513d47..c2fc649 100644
+--- a/src/internal.h
++++ b/src/internal.h
+@@ -366,7 +366,7 @@ struct tree *make_tree(char *label, char *value,
+  */
+ struct tree  *make_tree_origin(struct tree *root);
+ 
+-int tree_replace(struct tree *origin, const char *path, struct tree *sub);
++int tree_replace(struct augeas *aug, const char *path, struct tree *sub);
+ /* Make a new tree node and append it to parent's children */
+ struct tree *tree_append(struct tree *parent, char *label, char *value);
+ 
+diff --git a/src/transform.c b/src/transform.c
+index 00552da..fa082c3 100644
+--- a/src/transform.c
++++ b/src/transform.c
+@@ -497,7 +497,7 @@ static int load_file(struct augeas *aug, struct lens *lens,
+         goto done;
+     }
+ 
+-    tree_replace(aug->origin, path, tree);
++    tree_replace(aug, path, tree);
+     tree = NULL;
+ 
+     result = 0;
+diff --git a/tests/test-load.c b/tests/test-load.c
+index fe92305..2daf49c 100644
+--- a/tests/test-load.c
++++ b/tests/test-load.c
+@@ -28,8 +28,8 @@
+ #include "internal.h"
+ 
+ #define CuAssertPositive(tc, n) CuAssertTrue(tc, (n) > 0)
+-#define CuAssertZero(tc, n) CuAssertTrue(tc, (n) == 0)
+-#define CuAssertRetSuccess(tc, n) CuAssertTrue(tc, (n) == 0)
++#define CuAssertZero(tc, n) CuAssertIntEquals(tc, 0, (n))
++#define CuAssertRetSuccess(tc, n) CuAssertIntEquals(tc, 0, (n))
+ 
+ static const char *abs_top_srcdir;
+ static const char *abs_top_builddir;
+@@ -400,6 +400,53 @@ static void testReloadDeletedMeta(CuTest *tc) {
+     aug_close(aug);
+ }
+ 
++/* BZ 613967 - segfault when reloading a file that has been externally
++ * modified, and we have a variable pointing into the old tree
++ */
++static void testReloadExternalMod(CuTest *tc) {
++    augeas *aug = NULL;
++    int r, created;
++    const char *aug_root;
++
++    aug = setup_writable_hosts(tc);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    /* Set up a new entry and save */
++    r = aug_defnode(aug, "new", "/files/etc/hosts/3", NULL, &created);
++    CuAssertIntEquals(tc, 1, r);
++    CuAssertIntEquals(tc, 1, created);
++
++    r = aug_set(aug, "$new/ipaddr", "172.31.42.1");
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_set(aug, "$new/canonical", "new.example.com");
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_save(aug);
++    CuAssertRetSuccess(tc, r);
++
++    /* Now modify the file outside of Augeas */
++    r = aug_get(aug, "/augeas/root", &aug_root);
++    CuAssertIntEquals(tc, 1, r);
++
++    run(tc, "sed -i -e '1,2d' %setc/hosts", aug_root);
++
++    /* Reload and save again */
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_save(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_match(aug, "/files/etc/hosts/#comment", NULL);
++    CuAssertIntEquals(tc, 2, r);
++
++    r = aug_match(aug, "/files/etc/hosts/*", NULL);
++    CuAssertIntEquals(tc, 5, r);
++}
++
+ int main(void) {
+     char *output = NULL;
+     CuSuite* suite = CuSuiteNew();
+@@ -416,6 +463,7 @@ int main(void) {
+     SUITE_ADD_TEST(suite, testReloadDirty);
+     SUITE_ADD_TEST(suite, testReloadDeleted);
+     SUITE_ADD_TEST(suite, testReloadDeletedMeta);
++    SUITE_ADD_TEST(suite, testReloadExternalMod);
+ 
+     abs_top_srcdir = getenv("abs_top_srcdir");
+     if (abs_top_srcdir == NULL)

@@ -1,0 +1,68 @@
+From 0695bdd057b2cbfc6146ac498179c0f162ee889f Mon Sep 17 00:00:00 2001
+From: David Lutterkort <lutter@redhat.com>
+Date: Tue, 29 Jun 2010 15:46:53 -0700
+Subject: [PATCH 8/9] Add utility tree_store_value to avoid unnecessary strdup's
+
+  * src/internal.h (tree_store_value): add prototype
+  * src/augeas.c (tree_store_value): new function; (tree_set_value): use
+    tree_store_value
+---
+ src/augeas.c   |   18 ++++++++++++++----
+ src/internal.h |    5 ++++-
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/augeas.c b/src/augeas.c
+index 5ca1789..744b699 100644
+--- a/src/augeas.c
++++ b/src/augeas.c
+@@ -156,17 +156,27 @@ struct tree *tree_find_cr(struct augeas *aug, const char *path) {
+     return result;
+ }
+ 
+-int tree_set_value(struct tree *tree, const char *value) {
++void tree_store_value(struct tree *tree, char **value) {
+     if (tree->value != NULL) {
+         free(tree->value);
+         tree->value = NULL;
+     }
++    if (*value != NULL) {
++        tree->value = *value;
++        *value = NULL;
++    }
++    tree_mark_dirty(tree);
++}
++
++int tree_set_value(struct tree *tree, const char *value) {
++    char *v = NULL;
++
+     if (value != NULL) {
+-        tree->value = strdup(value);
+-        if (tree->value == NULL)
++        v = strdup(value);
++        if (v == NULL)
+             return -1;
+     }
+-    tree_mark_dirty(tree);
++    tree_store_value(tree, &v);
+     return 0;
+ }
+ 
+diff --git a/src/internal.h b/src/internal.h
+index f1e6f3a..7513d47 100644
+--- a/src/internal.h
++++ b/src/internal.h
+@@ -389,7 +389,10 @@ struct tree *tree_child_cr(struct tree *tree, const char *label);
+ /* Create a path in the tree; nodes along the path are looked up with
+  * tree_child_cr */
+ struct tree *tree_path_cr(struct tree *tree, int n, ...);
+-/* Set the value of TREE and update dirty flags */
++/* Store VALUE directly as the value of TREE and set VALUE to NULL.
++ * Update dirty flags */
++void tree_store_value(struct tree *tree, char **value);
++/* Set the value of TREE to a copy of VALUE and update dirty flags */
+ int tree_set_value(struct tree *tree, const char *value);
+ /* Cleanly remove all children of TREE, but leave TREE itself unchanged */
+ void tree_unlink_children(struct augeas *aug, struct tree *tree);
+-- 
+1.6.6.1
+

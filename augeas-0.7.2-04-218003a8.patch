@@ -1,0 +1,96 @@
+From 218003a813acae99370d45157fe57589b8a8685c Mon Sep 17 00:00:00 2001
+From: David Lutterkort <lutter@redhat.com>
+Date: Tue, 29 Jun 2010 14:50:14 -0700
+Subject: [PATCH 4/9] Move 'run' test utility to cutest.[ch]
+
+  * tests/cutest.h (run): add prototype
+  * tests/cutest.c (run): add impl
+  * tests/test-save.c (run): remove
+---
+ tests/cutest.c    |   24 ++++++++++++++++++++++++
+ tests/cutest.h    |    2 ++
+ tests/test-save.c |   20 --------------------
+ 3 files changed, 26 insertions(+), 20 deletions(-)
+
+diff --git a/tests/cutest.c b/tests/cutest.c
+index 4cfe0fc..120e31c 100644
+--- a/tests/cutest.c
++++ b/tests/cutest.c
+@@ -296,6 +296,30 @@ void CuSuiteDetails(CuSuite* testSuite, char **details) {
+ }
+ 
+ /*
++ * Test utilities
++ */
++void run(CuTest *tc, const char *format, ...) {
++    char *command;
++    va_list args;
++    int r;
++
++    va_start(args, format);
++    r = vasprintf(&command, format, args);
++    va_end (args);
++    if (r < 0)
++        CuFail(tc, "Failed to format command (out of memory)");
++    r = system(command);
++    if (r < 0 || (WIFEXITED(r) && WEXITSTATUS(r) != 0)) {
++        char *msg;
++        r = asprintf(&msg, "Command %s failed with status %d\n",
++                     command, WEXITSTATUS(r));
++        CuFail(tc, msg);
++        free(msg);
++    }
++    free(command);
++}
++
++/*
+  * Local variables:
+  *  indent-tabs-mode: nil
+  *  c-indent-level: 4
+diff --git a/tests/cutest.h b/tests/cutest.h
+index ae9fe0f..a667e50 100644
+--- a/tests/cutest.h
++++ b/tests/cutest.h
+@@ -120,6 +120,8 @@ void CuSuiteRun(CuSuite* testSuite);
+ void CuSuiteSummary(CuSuite* testSuite, char **summary);
+ void CuSuiteDetails(CuSuite* testSuite, char **details);
+ 
++/* Run a command */
++void run(CuTest *tc, const char *format, ...);
+ #endif /* CU_TEST_H */
+ 
+ /*
+diff --git a/tests/test-save.c b/tests/test-save.c
+index c563ad3..daeace3 100644
+--- a/tests/test-save.c
++++ b/tests/test-save.c
+@@ -40,26 +40,6 @@ struct augeas *aug = NULL;
+         exit(EXIT_FAILURE);                                         \
+     } while(0)
+ 
+-static void run(CuTest *tc, const char *format, ...) {
+-    char *command;
+-    va_list args;
+-    int r;
+-
+-    va_start(args, format);
+-    r = vasprintf(&command, format, args);
+-    va_end (args);
+-    if (r < 0)
+-        CuFail(tc, "Failed to format command (out of memory)");
+-    r = system(command);
+-    if (r < 0 || (WIFEXITED(r) && WEXITSTATUS(r) != 0)) {
+-        char *msg;
+-        r = asprintf(&msg, "Command %s failed with status %d\n",
+-                     command, WEXITSTATUS(r));
+-        CuFail(tc, msg);
+-        free(msg);
+-    }
+-}
+-
+ static void setup(CuTest *tc) {
+     char *lensdir;
+ 
+-- 
+1.6.6.1
+

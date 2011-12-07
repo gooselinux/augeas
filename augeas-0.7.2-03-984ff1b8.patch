@@ -1,0 +1,56 @@
+From 984ff1b8f37c64339ed9663d2b052dadbea82032 Mon Sep 17 00:00:00 2001
+From: David Lutterkort <lutter@redhat.com>
+Date: Tue, 29 Jun 2010 14:21:42 -0700
+Subject: [PATCH 3/9] Redefine all variables upon load
+
+This is a slight change in behavior: before, we used to just discard the
+contents of all variables upon load. Now, we redefine variables by
+evaluating the expression with which they were defined initially again.
+
+The change in behavior is backwards compatible, since at worst, users will
+redefine variables themselves after an aug_load
+---
+ src/augeas.c      |    6 ++++++
+ tests/test-load.c |    2 +-
+ 2 files changed, 7 insertions(+), 1 deletions(-)
+
+diff --git a/src/augeas.c b/src/augeas.c
+index 9ca26b6..2e5f296 100644
+--- a/src/augeas.c
++++ b/src/augeas.c
+@@ -447,6 +447,7 @@ int aug_load(struct augeas *aug) {
+     struct tree *meta_files = tree_child_cr(meta, s_files);
+     struct tree *files = tree_child_cr(aug->origin, s_files);
+     struct tree *load = tree_child_cr(meta, s_load);
++    struct tree *vars = tree_child_cr(meta, s_vars);
+ 
+     api_entry(aug);
+ 
+@@ -461,6 +462,11 @@ int aug_load(struct augeas *aug) {
+     }
+     tree_clean(aug->origin);
+ 
++    list_for_each(v, vars->children) {
++        aug_defvar(aug, v->label, v->value);
++        ERR_BAIL(aug);
++    }
++
+     api_exit(aug);
+     return 0;
+  error:
+diff --git a/tests/test-load.c b/tests/test-load.c
+index 547e222..e4dd38a 100644
+--- a/tests/test-load.c
++++ b/tests/test-load.c
+@@ -205,7 +205,7 @@ static void testLoadDefined(CuTest *tc) {
+     CuAssertRetSuccess(tc, r);
+ 
+     r = aug_match(aug, "$v", NULL);
+-    CuAssertIntEquals(tc, 0, r);
++    CuAssertIntEquals(tc, 2, r);
+ 
+     aug_close(aug);
+ }
+-- 
+1.6.6.1
+

@@ -1,0 +1,33 @@
+From 0c43ca0f0ce9008a991c2a2d99e938f4a60712a3 Mon Sep 17 00:00:00 2001
+From: David Lutterkort <lutter@redhat.com>
+Date: Tue, 29 Jun 2010 14:12:47 -0700
+Subject: [PATCH 1/9] * src/augeas.c (aug_defvar): use constants to create /augeas/variables
+
+---
+ src/augeas.c |    3 ++-
+ 1 files changed, 2 insertions(+), 1 deletions(-)
+
+diff --git a/src/augeas.c b/src/augeas.c
+index c21afe9..7b51a77 100644
+--- a/src/augeas.c
++++ b/src/augeas.c
+@@ -41,6 +41,7 @@ static const char *const s_load   = "load";
+ static const char *const s_pathx  = "pathx";
+ static const char *const s_error  = "error";
+ static const char *const s_pos    = "pos";
++static const char *const s_vars   = "variables";
+ 
+ #define TREE_HIDDEN(tree) ((tree)->label == NULL)
+ 
+@@ -529,7 +530,7 @@ int aug_defvar(augeas *aug, const char *name, const char *expr) {
+     ERR_BAIL(aug);
+ 
+     /* Record the definition of the variable */
+-    struct tree *tree = tree_path_cr(aug->origin, 2, "augeas", "variables");
++    struct tree *tree = tree_path_cr(aug->origin, 2, s_augeas, s_vars);
+     ERR_NOMEM(tree == NULL, aug);
+     if (expr == NULL) {
+         tree = tree_child(tree, name);
+-- 
+1.6.6.1
+

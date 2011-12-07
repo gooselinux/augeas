@@ -1,0 +1,501 @@
+From 5ee8163051be8214507c13c86171ac90ca7cb91f Mon Sep 17 00:00:00 2001
+From: David Lutterkort <lutter@redhat.com>
+Date: Tue, 29 Jun 2010 15:32:44 -0700
+Subject: [PATCH 9/9] Avoid unnecessary file parsing when reloading the tree
+
+We used to reparse every file we knew about upon aug_load. Now, we only
+reparse files if the file has changed on disk.
+
+We test a few scenarios to make sure aug_load retains its behavior of
+obliterating the tree and filling it with the latest from disk. This
+includes throwing away unsaved changes or trees that have been deleted.
+---
+ src/augeas.c      |   72 ++++++++++++++++++++++++++-
+ src/transform.c   |   78 +++++++++++++++++++++++++++--
+ tests/cutest.c    |   17 ++++++
+ tests/cutest.h    |    4 ++
+ tests/test-load.c |  142 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/xpath.tests |    1 +
+ 6 files changed, 307 insertions(+), 7 deletions(-)
+
+diff --git a/src/augeas.c b/src/augeas.c
+index 744b699..45c2207 100644
+--- a/src/augeas.c
++++ b/src/augeas.c
+@@ -451,6 +451,51 @@ void tree_unlink_children(struct augeas *aug, struct tree *tree) {
+         tree_unlink(tree->children);
+ }
+ 
++static void tree_mark_files(struct tree *tree) {
++    if (tree_child(tree, "path") != NULL) {
++        tree_mark_dirty(tree);
++    } else {
++        list_for_each(c, tree->children) {
++            tree_mark_files(c);
++        }
++    }
++}
++
++static void tree_rm_dirty_files(struct augeas *aug, struct tree *tree) {
++    struct tree *p;
++
++    if (!tree->dirty)
++        return;
++
++    if ((p = tree_child(tree, "path")) != NULL) {
++        aug_rm(aug, p->value);
++        tree_unlink(tree);
++    } else {
++        struct tree *c = tree->children;
++        while (c != NULL) {
++            struct tree *next = c->next;
++            tree_rm_dirty_files(aug, c);
++            c = next;
++        }
++    }
++}
++
++static void tree_rm_dirty_leaves(struct augeas *aug, struct tree *tree,
++                                 struct tree *protect) {
++    if (! tree->dirty)
++        return;
++
++    struct tree *c = tree->children;
++    while (c != NULL) {
++        struct tree *next = c->next;
++        tree_rm_dirty_leaves(aug, c, protect);
++        c = next;
++    }
++
++    if (tree != protect && tree->children == NULL)
++        tree_unlink(tree);
++}
++
+ int aug_load(struct augeas *aug) {
+     struct tree *meta = tree_child_cr(aug->origin, s_augeas);
+     struct tree *meta_files = tree_child_cr(meta, s_files);
+@@ -462,13 +507,36 @@ int aug_load(struct augeas *aug) {
+ 
+     ERR_NOMEM(load == NULL, aug);
+ 
+-    tree_unlink_children(aug, meta_files);
+-    tree_unlink_children(aug, files);
++    /* To avoid unnecessary loads of files, we reload an existing file in
++     * several steps:
++     * (1) mark all file nodes under /augeas/files as dirty (and only those)
++     * (2) process all files matched by a lens; we check (in
++     *     transform_load) if the file has been modified. If it has, we
++     *     reparse it. Either way, we clear the dirty flag. We also need to
++     *     reread the file if part or all of it has been modified in the
++     *     tree but not been saved yet
++     * (3) remove all files from the tree that still have a dirty entry
++     *     under /augeas/files. Those files are not processed by any lens
++     *     anymore
++     * (4) Remove entries from /augeas/files and /files that correspond
++     *     to directories without any files of interest
++     */
++    tree_clean(meta_files);
++    tree_mark_files(meta_files);
+ 
+     list_for_each(xfm, load->children) {
+         if (transform_validate(aug, xfm) == 0)
+             transform_load(aug, xfm);
+     }
++
++    /* This makes it possible to spot 'directories' that are now empty
++     * because we removed their file contents */
++    tree_clean(files);
++
++    tree_rm_dirty_files(aug, meta_files);
++    tree_rm_dirty_leaves(aug, meta_files, meta_files);
++    tree_rm_dirty_leaves(aug, files, files);
++
+     tree_clean(aug->origin);
+ 
+     list_for_each(v, vars->children) {
+diff --git a/src/transform.c b/src/transform.c
+index 0c56034..00552da 100644
+--- a/src/transform.c
++++ b/src/transform.c
+@@ -49,6 +49,7 @@ static const int glob_flags = GLOB_NOSORT;
+ /* Loaded files are tracked underneath METATREE. When a file with name
+  * FNAME is loaded, certain entries are made under METATREE / FNAME:
+  *   path      : path where tree for FNAME is put
++ *   mtime     : time of last modification of the file as reported by stat(2)
+  *   lens/info : information about where the applied lens was loaded from
+  *   lens/id   : unique hexadecimal id of the lens
+  *   error     : indication of errors during processing FNAME, or NULL
+@@ -60,6 +61,7 @@ static const int glob_flags = GLOB_NOSORT;
+ static const char *const s_path = "path";
+ static const char *const s_lens = "lens";
+ static const char *const s_info = "info";
++static const char *const s_mtime = "mtime";
+ 
+ static const char *const s_error = "error";
+ /* These are all put underneath "error" */
+@@ -111,6 +113,59 @@ static bool is_regular_file(const char *path) {
+     return S_ISREG(st.st_mode);
+ }
+ 
++static char *mtime_as_string(struct augeas *aug, const char *fname) {
++    int r;
++    struct stat st;
++    char *result = NULL;
++
++    r = stat(fname, &st);
++    if (r < 0) {
++        /* If we fail to stat, silently ignore the error
++         * and report an impossible mtime */
++        result = strdup("0");
++        ERR_NOMEM(result == NULL, aug);
++    } else {
++        r = xasprintf(&result, "%ld", (long) st.st_mtime);
++        ERR_NOMEM(r < 0, aug);
++    }
++    return result;
++ error:
++    FREE(result);
++    return NULL;
++}
++
++static bool file_current(struct augeas *aug, const char *fname,
++                         struct tree *finfo) {
++    struct tree *mtime = tree_child(finfo, s_mtime);
++    struct tree *file = NULL, *path = NULL;
++    int r;
++    struct stat st;
++    int64_t mtime_i;
++
++    if (mtime == NULL || mtime->value == NULL)
++        return false;
++
++    r = xstrtoint64(mtime->value, 10, &mtime_i);
++    if (r < 0) {
++        /* Ignore silently and err on the side of caution */
++        return false;
++    }
++
++    r = stat(fname, &st);
++    if (r < 0)
++        return false;
++
++    if (mtime_i != (int64_t) st.st_mtime)
++        return false;
++
++    path = tree_child(finfo, s_path);
++    if (path == NULL)
++        return false;
++
++    file = tree_find(aug, path->value);
++    return (file != NULL && ! file->dirty);
++}
++
+ static int filter_generate(struct tree *xfm, const char *root,
+                            int *nmatches, char ***matches) {
+     glob_t globbuf;
+@@ -326,7 +381,8 @@ static int store_error(struct augeas *aug,
+  * Returns 0 on success, -1 on error
+  */
+ static int add_file_info(struct augeas *aug, const char *node,
+-                         struct lens *lens, const char *lens_name) {
++                         struct lens *lens, const char *lens_name,
++                         const char *filename) {
+     struct tree *file, *tree;
+     char *tmp = NULL;
+     int r;
+@@ -348,6 +404,13 @@ static int add_file_info(struct augeas *aug, const char *node,
+     r = tree_set_value(tree, node);
+     ERR_NOMEM(r < 0, aug);
+ 
++    /* Set 'mtime' */
++    tmp = mtime_as_string(aug, filename);
++    ERR_BAIL(aug);
++    tree = tree_child_cr(file, s_mtime);
++    ERR_NOMEM(tree == NULL, aug);
++    tree_store_value(tree, &tmp);
++
+     /* Set 'lens/info' */
+     tmp = format_info(lens->info);
+     ERR_NOMEM(tmp == NULL, aug);
+@@ -362,6 +425,8 @@ static int add_file_info(struct augeas *aug, const char *node,
+     r = tree_set_value(tree, lens_name);
+     ERR_NOMEM(r < 0, aug);
+ 
++    tree_clean(file);
++
+     result = 0;
+  error:
+     free(path);
+@@ -404,7 +469,7 @@ static int load_file(struct augeas *aug, struct lens *lens,
+     path = file_name_path(aug, filename);
+     ERR_NOMEM(path == NULL, aug);
+ 
+-    r = add_file_info(aug, path, lens, lens_name);
++    r = add_file_info(aug, path, lens, lens_name, filename);
+     if (r < 0)
+         goto done;
+ 
+@@ -602,7 +667,8 @@ int transform_load(struct augeas *aug, struct tree *xfm) {
+     for (int i=0; i < nmatches; i++) {
+         const char *filename = matches[i] + strlen(aug->root) - 1;
+         struct tree *finfo = file_info(aug, filename);
+-        if (finfo != NULL && tree_child(finfo, s_lens) != NULL) {
++        if (finfo != NULL && !finfo->dirty &&
++            tree_child(finfo, s_lens) != NULL) {
+             const char *s = xfm_lens_name(finfo);
+             char *fpath = file_name_path(aug, matches[i]);
+             transform_file_error(aug, "mxfm_load", filename,
+@@ -610,9 +676,11 @@ int transform_load(struct augeas *aug, struct tree *xfm) {
+                                  s, lens_name);
+             aug_rm(aug, fpath);
+             free(fpath);
+-        } else {
++        } else if (!file_current(aug, matches[i], finfo)) {
+             load_file(aug, lens, lens_name, matches[i]);
+         }
++        if (finfo != NULL)
++            finfo->dirty = 0;
+         FREE(matches[i]);
+     }
+     lens_release(lens);
+@@ -945,7 +1013,7 @@ int transform_save(struct augeas *aug, struct tree *xfm,
+     result = 1;
+ 
+  done:
+-    r = add_file_info(aug, path, lens, lens_name);
++    r = add_file_info(aug, path, lens, lens_name, filename);
+     if (r < 0) {
+         err_status = "file_info";
+         result = -1;
+diff --git a/tests/cutest.c b/tests/cutest.c
+index 120e31c..08dbfd7 100644
+--- a/tests/cutest.c
++++ b/tests/cutest.c
+@@ -138,6 +138,23 @@ void CuAssertStrEquals_LineMsg(CuTest* tc, const char* file, int line,
+ 	CuFailInternal(tc, file, line, string);
+ }
+ 
++void CuAssertStrNotEqual_LineMsg(CuTest* tc, const char* file, int line,
++                                 const char* message,
++                                 const char* expected, const char* actual) {
++	char *string = NULL;
++
++    if (expected != NULL && actual != NULL && strcmp(expected, actual) != 0)
++        return;
++
++	if (message != NULL) {
++        asprintf_or_die(&string, "%s: expected <%s> but was <%s>", message,
++                        expected, actual);
++	} else {
++        asprintf_or_die(&string, "expected <%s> but was <%s>", expected, actual);
++    }
++	CuFailInternal(tc, file, line, string);
++}
++
+ void CuAssertIntEquals_LineMsg(CuTest* tc, const char* file, int line,
+                                const char* message,
+                                int expected, int actual) {
+diff --git a/tests/cutest.h b/tests/cutest.h
+index a667e50..616fb1f 100644
+--- a/tests/cutest.h
++++ b/tests/cutest.h
+@@ -61,6 +61,9 @@ void CuAssert_Line(CuTest* tc, const char* file, int line, const char* message,
+ void CuAssertStrEquals_LineMsg(CuTest* tc,
+ 	const char* file, int line, const char* message,
+ 	const char* expected, const char* actual);
++void CuAssertStrNotEqual_LineMsg(CuTest* tc,
++	const char* file, int line, const char* message,
++	const char* expected, const char* actual);
+ void CuAssertIntEquals_LineMsg(CuTest* tc,
+ 	const char* file, int line, const char* message,
+ 	int expected, int actual);
+@@ -82,6 +85,7 @@ void CuAssertPtrNotEqual_LineMsg(CuTest* tc,
+ 
+ #define CuAssertStrEquals(tc,ex,ac)           CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+ #define CuAssertStrEquals_Msg(tc,ms,ex,ac)    CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
++#define CuAssertStrNotEqual(tc,ex,ac)         CuAssertStrNotEqual_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+ #define CuAssertIntEquals(tc,ex,ac)           CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+ #define CuAssertIntEquals_Msg(tc,ms,ex,ac)    CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
+ #define CuAssertDblEquals(tc,ex,ac,dl)        CuAssertDblEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac),(dl))
+diff --git a/tests/test-load.c b/tests/test-load.c
+index a8107a1..fe92305 100644
+--- a/tests/test-load.c
++++ b/tests/test-load.c
+@@ -70,6 +70,8 @@ static struct augeas *setup_writable_hosts(CuTest *tc) {
+     r = aug_set(aug, "/augeas/load/Hosts/incl", "/etc/hosts");
+     CuAssertRetSuccess(tc, r);
+ 
++    free(build_root);
++    free(etcdir);
+     return aug;
+ }
+ 
+@@ -262,6 +264,142 @@ static void testDefvarExpr(CuTest *tc) {
+     aug_close(aug);
+ }
+ 
++static void testReloadChanged(CuTest *tc) {
++    FILE *fp;
++    augeas *aug = NULL;
++    const char *build_root, *mtime2, *s;
++    char *mtime1;
++    char *hosts = NULL;
++    int r;
++
++    aug = setup_writable_hosts(tc);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_get(aug, "/augeas/root", &build_root);
++    CuAssertIntEquals(tc, 1, r);
++
++    r = aug_get(aug, "/augeas/files/etc/hosts/mtime", &s);
++    CuAssertIntEquals(tc, 1, r);
++    mtime1 = strdup(s);
++    CuAssertPtrNotNull(tc, mtime1);
++
++    /* Tickle /etc/hosts behind augeas' back */
++    r = asprintf(&hosts, "%setc/hosts", build_root);
++    CuAssertPositive(tc, r);
++
++    fp = fopen(hosts, "a");
++    CuAssertPtrNotNull(tc, fp);
++
++    r = fprintf(fp, "192.168.0.1 other.example.com\n");
++    CuAssertTrue(tc, r > 0);
++
++    r = fclose(fp);
++    CuAssertRetSuccess(tc, r);
++
++    /* Unsaved changes are discarded */
++    r = aug_set(aug, "/files/etc/hosts/1/ipaddr", "127.0.0.2");
++    CuAssertRetSuccess(tc, r);
++
++    /* Check that we really did load the right file*/
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_get(aug, "/augeas/files/etc/hosts/mtime", &mtime2);
++    CuAssertIntEquals(tc, 1, r);
++    CuAssertStrNotEqual(tc, mtime1, mtime2);
++
++    r = aug_match(aug, "/files/etc/hosts/*[ipaddr = '192.168.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    r = aug_match(aug, "/files/etc/hosts/1[ipaddr = '127.0.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    free(mtime1);
++    free(hosts);
++    aug_close(aug);
++}
++
++static void testReloadDirty(CuTest *tc) {
++    augeas *aug = NULL;
++    int r;
++
++    aug = setup_writable_hosts(tc);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    /* Unsaved changes are discarded */
++    r = aug_set(aug, "/files/etc/hosts/1/ipaddr", "127.0.0.2");
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_match(aug, "/files/etc/hosts/1[ipaddr = '127.0.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    aug_close(aug);
++}
++
++static void testReloadDeleted(CuTest *tc) {
++    augeas *aug = NULL;
++    int r;
++
++    aug = setup_writable_hosts(tc);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    /* A missing file causes a reload */
++    r = aug_rm(aug, "/files/etc/hosts");
++    CuAssertPositive(tc, r);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_match(aug, "/files/etc/hosts/1[ipaddr = '127.0.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    /* A missing entry in a file causes a reload */
++    r = aug_rm(aug, "/files/etc/hosts/1/ipaddr");
++    CuAssertPositive(tc, r);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_match(aug, "/files/etc/hosts/1[ipaddr = '127.0.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    aug_close(aug);
++}
++
++static void testReloadDeletedMeta(CuTest *tc) {
++    augeas *aug = NULL;
++    int r;
++
++    aug = setup_writable_hosts(tc);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    /* Unsaved changes are discarded */
++    r = aug_rm(aug, "/augeas/files/etc/hosts");
++    CuAssertPositive(tc, r);
++
++    r = aug_set(aug, "/files/etc/hosts/1/ipaddr", "127.0.0.2");
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_load(aug);
++    CuAssertRetSuccess(tc, r);
++
++    r = aug_match(aug, "/files/etc/hosts/1[ipaddr = '127.0.0.1']", NULL);
++    CuAssertIntEquals(tc, 1, r);
++
++    aug_close(aug);
++}
++
+ int main(void) {
+     char *output = NULL;
+     CuSuite* suite = CuSuiteNew();
+@@ -274,6 +412,10 @@ int main(void) {
+     SUITE_ADD_TEST(suite, testLoadSave);
+     SUITE_ADD_TEST(suite, testLoadDefined);
+     SUITE_ADD_TEST(suite, testDefvarExpr);
++    SUITE_ADD_TEST(suite, testReloadChanged);
++    SUITE_ADD_TEST(suite, testReloadDirty);
++    SUITE_ADD_TEST(suite, testReloadDeleted);
++    SUITE_ADD_TEST(suite, testReloadDeletedMeta);
+ 
+     abs_top_srcdir = getenv("abs_top_srcdir");
+     if (abs_top_srcdir == NULL)
+diff --git a/tests/xpath.tests b/tests/xpath.tests
+index f2575a3..b16792a 100644
+--- a/tests/xpath.tests
++++ b/tests/xpath.tests
+@@ -148,6 +148,7 @@ test ipaddr-sibling //*[../ipaddr]
+ 
+ test lircd-ancestor //*[ancestor::kudzu][label() != '#comment']
+      /augeas/files/etc/sysconfig/kudzu/path = /files/etc/sysconfig/kudzu
++     /augeas/files/etc/sysconfig/kudzu/mtime = ...
+      /augeas/files/etc/sysconfig/kudzu/lens = @Shellvars
+      /augeas/files/etc/sysconfig/kudzu/lens/info = ...
+      /files/etc/sysconfig/kudzu/SAFE = no
+-- 
+1.6.6.1
+
